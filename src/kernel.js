@@ -87,6 +87,7 @@ fn.cpuset_setaffinity = new NativeFunction(0x1e8, 'number');
 fn.mmap = new NativeFunction(0x1dd, 'bint');
 fn.mname = new NativeFunction(0x24c, 'number');
 fn.jitshm_create = new NativeFunction(0x215, 'number');
+fn.jitshm_alias = new NativeFunction(0x216, 'number');
 fn.kexec = new NativeFunction(0x295, 'number');
 //#endregion
 //#region Classes
@@ -510,6 +511,20 @@ function kview(addr) {
 
 function fget(fd) {
   return kview(fdt_ofiles).getBInt(fd * k_filedesc_sizeof, true);
+}
+
+function refresh_fdt_ofiles() {
+  const p = pfind(fn.getpid.invoke());
+  if (p.eq(0)) {
+    throw new Error('Unable to find current process !!');
+  }
+
+  const p_fd = kview(p).getBInt(0x48, true);
+
+  fdt_ofiles = kview(p_fd).getBInt(0, true).add(k_filedesc_fdt_ofiles);
+  logger.debug(`fdt_ofiles: ${fdt_ofiles}`);
+
+  return fdt_ofiles;
 }
 
 function fput(fd, fp) {
