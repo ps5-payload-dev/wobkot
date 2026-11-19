@@ -167,7 +167,7 @@ function resolve_syscall_wrapper() {
 async function post_jailbreak() {
   await load_script('src/elfldr.js');
 
-  const elfldr = await load_elf('src/ps5/elfldr.elf');
+  const elfldr = await load_elf('src/ps5/elfldr-ps5.elf');
 
   const [read_fd, write_fd] = make_pipe();
   const rwpipe = mem.alloc(8);
