@@ -1,0 +1,39 @@
+name: Bundle
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest elfldr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download \
+            --repo ps5-payload-dev/elfldr \
+            --pattern 'elfldr-ps5.elf' \
+            --output src/ps5/elfldr-ps5.elf \
+            --clobber
+          file src/ps5/elfldr-ps5.elf
+
+      - name: Create tarball
+        run: |
+          name="wobkot-${GITHUB_SHA::7}.tar.gz"
+          tar --exclude-vcs -czf "/tmp/${name}" .
+          mv "/tmp/${name}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wobkot-tarball
+          path: wobkot-*.tar.gz
+          if-no-files-found: error
