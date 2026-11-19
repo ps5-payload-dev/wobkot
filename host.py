@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from ssl import SSLContext, PROTOCOL_TLS_SERVER
 
