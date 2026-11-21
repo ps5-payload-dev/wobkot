@@ -79,6 +79,11 @@ function patch_proc(p, kp) {
 
 function kernel_data_base() {
   const deltas = {
+    1: 0x1b40000,
+    2: 0x1b80000,
+    3: 0xbd0000,
+    4: 0xc00000,
+    5: 0xc40000,
     6: 0xc60000,
     7: 0xc50000,
     8: 0xc70000,
@@ -86,6 +91,7 @@ function kernel_data_base() {
     10: 0xcc0000,
     11: 0xd30000,
     12: 0xd50000,
+    14: 0xce0000,
   };
 
   let delta = version.major === 13 ? (version.minor >= 0x60 ? 0xcc0000 : 0xcb0000) : deltas[version.major];
